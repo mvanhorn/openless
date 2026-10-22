@@ -61,6 +61,16 @@ pub struct BackendSnapshot {
     pub credentials: CredentialsStatus,
 }
 
+/// Session-bound translation picker. Working languages come from the frozen recording context.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationTranslationTarget {
+    pub session_id: SessionId,
+    pub target_language: String,
+    pub working_languages: Vec<String>,
+    pub mutable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartupSnapshot {
@@ -1998,7 +2008,15 @@ impl ActiveTextInsertion {
                     self.drained.notify_waiters();
                     return;
                 }
-                std::mem::take(&mut state.stream.pending)
+                let delta = state.stream.take_ready_prefix();
+                if delta.is_empty() {
+                    // Whitespace alone waits for another delta, not another timer
+                    // tick. Final reconciliation will flush a trailing suffix.
+                    state.scheduled = false;
+                    self.drained.notify_waiters();
+                    return;
+                }
+                delta
             };
             let expected = delta.chars().count();
             let result = if delta.is_empty() {
@@ -5248,7 +5266,13 @@ impl OpenLessBackend {
                 | DictationPhase::Failed => Ok(CliDispatchOutcome::Noop),
             },
             crate::cli::CliIntent::ToggleQa => {
-                self.deps.services.qa.toggle_recording().await?;
+                let qa = &self.deps.services.qa;
+                let snapshot = qa.snapshot().await?;
+                match (snapshot.phase, snapshot.session_id) {
+                    (crate::QaPhase::Recording, Some(session_id)) => qa.stop_recording(session_id).await?,
+                    (crate::QaPhase::Thinking | crate::QaPhase::AwaitingApproval, _) => return Ok(CliDispatchOutcome::Noop),
+                    _ => qa.start_question().await?,
+                }
                 Ok(CliDispatchOutcome::QaToggled)
             }
             crate::cli::CliIntent::CancelDictation => {
@@ -5592,6 +5616,38 @@ impl OpenLessBackend {
         }
     }
 
+    /// Transfer the recording-key prefix into a fresh voice question. Serialize
+    /// with physical dictation edges so a delayed prefix release cannot restart
+    /// dictation after QA has acquired the microphone.
+    pub async fn start_voice_question_from_recording_key(&self) -> Result<(), BackendError> {
+        let _dispatch = self.hotkey_dispatch_gate.lock().await;
+        let snapshot = self.snapshot().dictation;
+        if let Some(session_id) = snapshot.session_id {
+            if !matches!(snapshot.phase, DictationPhase::Starting | DictationPhase::Recording) {
+                return Err(BackendError::new(BackendErrorCode::Busy, "dictation is finalizing"));
+            }
+            if let Err(error) = self.cancel_dictation(Some(session_id)).await {
+                // The independent combo-abort bridge may have claimed this same
+                // prefix already. Its native cleanup still owns the voice lease.
+                if self.snapshot().dictation.session_id.is_some()
+                    || error.code != BackendErrorCode::InvalidState { return Err(error); }
+            }
+        }
+        let provisional = std::mem::take(&mut *self.pending_audio_captures.lock()
+            .expect("pending audio capture lock poisoned"));
+        for capture in provisional.into_values() { capture.discard().await?; }
+        self.hotkey.lock().expect("hotkey interpreter lock poisoned").reset();
+        // Logical cancellation can precede the final native cleanup hold. Never
+        // cancel another domain or open a second microphone during that interval.
+        for _ in 0..25 {
+            if self.voice_sessions.runtime_restore_idle() {
+                return self.deps.services.qa.start_question().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Err(BackendError::new(BackendErrorCode::Busy, "microphone is still being released"))
+    }
+
     /// Accept the only mutable dictation intent into the current session. The
     /// engine only uses it during final polish, so synchronize at the common
     /// stop boundary instead of racing engine registration during Starting.
@@ -5643,6 +5699,65 @@ impl OpenLessBackend {
             }
         }
         Ok(())
+    }
+
+    pub fn dictation_translation_target(&self) -> Option<DictationTranslationTarget> {
+        let state = self.state.read().expect("backend state lock poisoned");
+        let context = state.dictation_context.as_ref()?;
+        Some(DictationTranslationTarget {
+            session_id: state.dictation.session_id?,
+            target_language: context.polish.translation_target_language.clone(),
+            working_languages: context.polish.working_languages.clone(),
+            mutable: state.running
+                && state.dictation.phase == DictationPhase::Recording
+                && context.polish.translation_active,
+        })
+    }
+
+    /// Explicitly retarget this recording and remember the choice. Ordinary settings
+    /// edits still leave an in-flight recording's frozen context untouched.
+    pub fn select_dictation_translation_target(
+        &self,
+        session_id: SessionId,
+        target_language: String,
+    ) -> Result<DictationTranslationTarget, BackendError> {
+        let target = crate::language_catalog::native_language_name(&target_language)
+            .ok_or_else(|| BackendError::new(BackendErrorCode::InvalidArgument, "unsupported translation language"))?;
+        let _write_guard = self.settings_write_gate.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.state.write().expect("backend state lock poisoned");
+        ensure_running(&state)?;
+        if state.dictation.session_id != Some(session_id)
+            || state.dictation.phase != DictationPhase::Recording
+        {
+            return Err(BackendError::new(BackendErrorCode::InvalidState,
+                "translation picker belongs to a recording that has ended"));
+        }
+        let context = state.dictation_context.as_ref().ok_or_else(||
+            BackendError::new(BackendErrorCode::InvalidState, "recording context is not ready"))?;
+        if !context.polish.translation_active
+            || !crate::shared_types::translation_effective(true, &target, &context.polish.working_languages)
+        {
+            return Err(BackendError::new(BackendErrorCode::InvalidArgument,
+                "translation is inactive or the target matches the only working language"));
+        }
+        let mut updated = (**context).clone();
+        updated.polish.translation_target_language = target.clone();
+        let result = DictationTranslationTarget {
+            session_id,
+            target_language: target.clone(),
+            working_languages: updated.polish.working_languages.clone(),
+            mutable: true,
+        };
+        // Keep finalization outside this critical section. A failed save changes neither
+        // the active target nor the remembered choice, and no other preference is overwritten.
+        self.preferences.update(|preferences| preferences.translation_target_language = target)?;
+        state.dictation_context = Some(Arc::new(updated));
+        // The common stop boundary must also send the changed context to a streaming engine.
+        state.dictation_translation_requested = Some(true);
+        drop(state);
+        self.publish_preferences_changed();
+        Ok(result)
     }
 
     pub fn siwc_service(&self) -> Result<Arc<crate::siwc::SiwcService>, BackendError> {
@@ -11291,12 +11406,17 @@ mod tests {
 
     #[derive(Default)]
     struct FakeQaControl {
+        starts: std::sync::atomic::AtomicUsize,
         stops: std::sync::atomic::AtomicUsize,
         cancels: std::sync::atomic::AtomicUsize,
         faults: std::sync::atomic::AtomicUsize,
     }
 
     impl crate::domains::QaApi for FakeQaControl {
+        fn start_question(&self) -> BoxFuture<'static, Result<(), BackendError>> {
+            self.starts.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async { Ok(()) })
+        }
         fn show(&self) -> BoxFuture<'static, Result<(), BackendError>> {
             Box::pin(async { Ok(()) })
         }
@@ -13591,6 +13711,111 @@ mod tests {
             Some(&HostAction::ShowDictationFeedback)
         );
         backend.cancel_dictation(Some(second)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn question_prefix_handoff_cancels_dictation_and_discards_its_late_release() {
+        let data_dir = TestDataDir::new("question-prefix-handoff");
+        let engine = crate::testing::FixtureDictationEngine::successful("must not insert", "unused");
+        let qa = Arc::new(FakeQaControl::default());
+        let mut deps = BackendDependencies::unsupported();
+        deps.dictation_engine = Arc::new(engine.clone());
+        deps.host_actions = Arc::new(FakeHost::default());
+        deps.text_inserter = Arc::new(crate::testing::FixtureTextInserter::with_outcome(InsertOutcome::Inserted));
+        deps.credential_store = llm_configured_credentials();
+        deps.services.qa = qa.clone();
+        let backend = OpenLessBackend::new(BackendConfig {data_dir:data_dir.path().to_path_buf(), ..Default::default()}, deps).unwrap();
+        backend.start().await.unwrap();
+        let mut prefs = backend.get_preferences();
+        prefs.hotkey.mode = crate::HotkeyMode::Hold;
+        backend.set_preferences(prefs).unwrap();
+        let at = std::time::Instant::now();
+        backend.dispatch_dictation_hotkey_edge(DictationHotkeyEdge::Pressed {press_id:7,at}).await.unwrap();
+        assert_eq!(backend.snapshot().dictation.phase, DictationPhase::Recording);
+        backend.start_voice_question_from_recording_key().await.unwrap();
+        assert_eq!(qa.starts.load(Ordering::Acquire), 1);
+        backend.dispatch_dictation_hotkey_edge(DictationHotkeyEdge::Released {press_id:7,at:std::time::Instant::now()}).await.unwrap();
+        assert_eq!(backend.snapshot().dictation.phase, DictationPhase::Idle);
+        assert!(backend.list_history().unwrap().is_empty());
+        backend.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn translation_picker_updates_current_engine_and_remembers_only_the_language() {
+        let data_dir = TestDataDir::new("translation-picker-current");
+        let engine = crate::testing::FixtureDictationEngine::successful("raw", "translated");
+        let backend = backend_with_dictation_engine(data_dir.path().to_path_buf(), Arc::new(engine.clone()));
+        backend.start().await.unwrap();
+        let mut prefs = backend.get_preferences();
+        prefs.translation_target_language = "English".into();
+        prefs.working_languages = vec!["简体中文".into()];
+        prefs.microphone_device_name = "captured microphone".into();
+        backend.set_preferences(prefs).unwrap();
+        let session = backend.start_dictation_with_options(DictationStartOptions {
+            translation_requested: true, ..Default::default()
+        }).await.unwrap();
+        let mut changed = backend.get_preferences();
+        changed.microphone_device_name = "next microphone".into();
+        backend.set_preferences(changed).unwrap();
+        let selected = backend.select_dictation_translation_target(session, "ja".into()).unwrap();
+        assert_eq!(selected.target_language, "日本語");
+        assert_eq!(backend.get_preferences().translation_target_language, "日本語");
+        assert_eq!(backend.get_preferences().microphone_device_name, "next microphone");
+        backend.stop_dictation().await.unwrap();
+        let contexts = engine.contexts();
+        let last = contexts.last().unwrap();
+        assert_eq!(last.polish.translation_target_language, "日本語");
+        assert_eq!(last.recording.microphone_device_name.as_deref(), Some("captured microphone"));
+        assert!(last.polish.translation_active);
+        backend.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn translation_picker_save_failure_keeps_active_and_saved_targets() {
+        let data_dir = TestDataDir::new("translation-picker-save-failure");
+        let engine = crate::testing::FixtureDictationEngine::successful("raw", "translated");
+        let backend = backend_with_dictation_engine(data_dir.path().to_path_buf(), Arc::new(engine));
+        backend.start().await.unwrap();
+        let mut prefs = backend.get_preferences();
+        prefs.translation_target_language = "English".into();
+        prefs.working_languages = vec!["简体中文".into()];
+        backend.set_preferences(prefs).unwrap();
+        let session = backend.start_dictation_with_options(DictationStartOptions {
+            translation_requested: true, ..Default::default()
+        }).await.unwrap();
+        let file = backend.preferences.persistence_path().to_path_buf();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(backend.select_dictation_translation_target(session, "日本語".into()).is_err());
+        assert_eq!(backend.dictation_translation_target().unwrap().target_language, "English");
+        assert_eq!(backend.get_preferences().translation_target_language, "English");
+        std::fs::remove_dir(&file).unwrap();
+        backend.cancel_dictation(Some(session)).await.unwrap();
+        backend.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn translation_picker_rejects_stale_sessions_finalization_and_redundant_targets() {
+        let data_dir = TestDataDir::new("translation-picker-stale");
+        let engine = crate::testing::FixtureDictationEngine::successful("raw", "translated");
+        let backend = backend_with_dictation_engine(data_dir.path().to_path_buf(), Arc::new(engine));
+        backend.start().await.unwrap();
+        let mut prefs = backend.get_preferences();
+        prefs.translation_target_language = "English".into();
+        prefs.working_languages = vec!["简体中文".into()];
+        backend.set_preferences(prefs).unwrap();
+        let options = DictationStartOptions { translation_requested: true, ..Default::default() };
+        let first = backend.start_dictation_with_options(options.clone()).await.unwrap();
+        backend.cancel_dictation(Some(first)).await.unwrap();
+        let second = backend.start_dictation_with_options(options).await.unwrap();
+        assert!(backend.select_dictation_translation_target(first, "日本語".into()).is_err());
+        assert!(backend.select_dictation_translation_target(second, "简体中文".into()).is_err());
+        assert!(backend.select_dictation_translation_target(second, "unknown".into()).is_err());
+        assert_eq!(backend.dictation_translation_target().unwrap().target_language, "English");
+        backend.stop_dictation().await.unwrap();
+        assert!(backend.select_dictation_translation_target(second, "日本語".into()).is_err());
+        assert_eq!(backend.get_preferences().translation_target_language, "English");
+        backend.shutdown().await.unwrap();
     }
 
     #[tokio::test]

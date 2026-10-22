@@ -16,6 +16,7 @@ import { useTranslation } from 'react-i18next';
 import { Icon } from '../../components/Icon';
 import { Modal } from '../../components/ui/Modal';
 import { useOverlayMotion } from '../../lib/motion';
+import { toggleGroupFeedback } from '../../lib/toggleFeedback';
 import { useSpringReorder } from '../../lib/useSpringReorder';
 import { PageSkeleton } from '../../components/ui/PageSkeleton';
 import { SelectLite } from '../../components/ui/SelectLite';
@@ -200,6 +201,10 @@ export function channelRowViewportTop(element: HTMLElement): number {
 
 /** A test result older than a day is stale news; the faded look signals it may no longer hold. */
 const STALE_TEST_SECONDS = 24 * 60 * 60;
+
+/** Covers the switch knob's 180ms slide (.ol-switch-thumb in refinements.css), plus the
+ * frames it can start late by. */
+const SWITCH_SLIDE_MS = 260;
 
 type ChannelTestMode = 'provider' | 'local-model' | 'unavailable';
 
@@ -395,13 +400,22 @@ export function ChannelList({
   };
 
   const onToggle = async (channel: Channel) => {
+    const enabled = !channel.enabled;
     emitSaved('saving', t('common.saving'));
+    // Flip in place first. Core re-sorts the list (a disabled channel sinks to the end), and
+    // moving a row re-inserts its node, which cancels a running transition: the re-sorted
+    // list lands only once the knob has finished sliding.
+    setChannels((list) =>
+      list.map((item) => (item.id === channel.id ? { ...item, enabled } : item)),
+    );
+    const slid = new Promise((resolve) => window.setTimeout(resolve, SWITCH_SLIDE_MS));
     try {
-      await setChannelEnabled(kind, channel.id, !channel.enabled);
+      await Promise.all([setChannelEnabled(kind, channel.id, enabled), slid]);
       await refresh();
       emitSaved('saved', t('common.saved'));
     } catch (error) {
       console.error('[channels] toggle failed', error);
+      await refresh();
       emitSaved('failed', t('common.operationFailed'));
     }
   };
@@ -518,6 +532,7 @@ export function ChannelList({
       <div
         ref={reorder.list}
         className="ol-reorder-list"
+        data-ol-toggle-group=""
         style={{
           display: 'flex',
           flexDirection: 'column',
@@ -680,31 +695,20 @@ export function ChannelList({
                   aria-checked={!retired && channel.enabled}
                   disabled={retired}
                   aria-label={t('settings.channels.enabledFor', { name: label })}
-                  onClick={() => void onToggle(channel)}
+                  onClick={(event) => {
+                    if (event.detail > 0) toggleGroupFeedback(event.currentTarget);
+                    void onToggle(channel);
+                  }}
                   style={{ ...ghostBtn, display: 'inline-flex', alignItems: 'center', gap: 7 }}
                 >
+                  {/* Same track, knob and timing as the settings Toggle, in its small size. */}
                   <span
                     aria-hidden="true"
-                    style={{
-                      width: 24,
-                      height: 14,
-                      borderRadius: 999,
-                      background:
-                        channel.enabled && !retired ? 'var(--ol-blue)' : 'var(--ol-toggle-off-bg)',
-                      position: 'relative',
-                    }}
+                    className="ol-switch"
+                    data-size="sm"
+                    data-checked={channel.enabled && !retired ? '' : undefined}
                   >
-                    <span
-                      style={{
-                        position: 'absolute',
-                        top: 2,
-                        left: channel.enabled && !retired ? 12 : 2,
-                        width: 10,
-                        height: 10,
-                        borderRadius: 999,
-                        background: 'var(--ol-toggle-knob)',
-                      }}
-                    />
+                    <span className="ol-switch-thumb" />
                   </span>
                   {t('settings.channels.enabled')}
                 </button>
